@@ -15,6 +15,7 @@ from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from aura_gateway.api.websocket import router as websocket_router
 from aura_gateway.core.config import Settings, get_settings
 from aura_gateway.core.database import get_engine_status, lifespan_db
 from aura_gateway.core.exceptions import register_exception_handlers
@@ -117,6 +118,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.settings = active
 
     register_exception_handlers(application)
+    # WebSocket upgrade requests bypass the HTTP middleware stack, so the
+    # streaming route is registered on the app rather than on an HTTP router.
+    application.include_router(websocket_router)
     application.add_middleware(
         CORSMiddleware,
         allow_origins=active.CORS_ORIGINS,

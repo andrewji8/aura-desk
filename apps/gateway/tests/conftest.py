@@ -17,12 +17,15 @@ if TYPE_CHECKING:
 
 # No database is reachable from the test runner; the engine still gets built so
 # the pool wiring is exercised, but nothing attempts a real handshake.
-os.environ.setdefault("AURA_DB_CONNECT_ON_STARTUP", "false")
-os.environ.setdefault(
-    "AURA_DATABASE_URL", "postgresql+asyncpg://aura:aura@localhost:5432/aura_test"
-)
-os.environ.setdefault("AURA_LOG_LEVEL", "WARNING")
-os.environ.setdefault("AURA_ENVIRONMENT", "local")
+#
+# These are assigned, not `setdefault`: a developer's local `.env` is read by
+# `Settings` and would otherwise leak DEBUG=true and a sqlite URL into the suite.
+os.environ["AURA_DEBUG"] = "false"
+os.environ["AURA_DB_CONNECT_ON_STARTUP"] = "false"
+os.environ["AURA_DB_FAIL_FAST_ON_STARTUP"] = "false"
+os.environ["AURA_DATABASE_URL"] = "postgresql+asyncpg://aura:aura@localhost:5432/aura_test"
+os.environ["AURA_LOG_LEVEL"] = "WARNING"
+os.environ["AURA_ENVIRONMENT"] = "local"
 
 
 @pytest.fixture

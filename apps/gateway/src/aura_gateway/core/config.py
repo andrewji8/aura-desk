@@ -110,12 +110,15 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _validate_runtime_combinations(self) -> Self:
         """Reject cross-field combinations that cannot produce a working app."""
-        # 架构师修改：允许 PostgreSQL 或 SQLite (用于本地无 DB 环境开发)
+        # Allow PostgreSQL in every environment, plus SQLite for local runs
+        # where no database server is reachable.
         is_pg = self.DATABASE_URL.startswith(f"{ASYNC_PG_SCHEME}://")
         is_sqlite = self.DATABASE_URL.startswith("sqlite+aiosqlite://")
 
         if not (is_pg or is_sqlite):
-            msg = f"AURA_DATABASE_URL must start with '{ASYNC_PG_SCHEME}://' or 'sqlite+aiosqlite://'"
+            msg = (
+                f"AURA_DATABASE_URL must start with '{ASYNC_PG_SCHEME}://' or 'sqlite+aiosqlite://'"
+            )
             raise ValueError(msg)
 
         if self.DEBUG and self.ENVIRONMENT == "prod":

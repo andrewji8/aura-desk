@@ -10,13 +10,13 @@ from aura_gateway.core.logging import _resolve_request_id, new_request_id
 
 
 def test_defaults_are_sane(monkeypatch: pytest.MonkeyPatch) -> None:
-    # conftest lowers the level globally to keep test output quiet; assert the
-    # shipped default instead of the ambient one.
+    # Assert the shipped defaults rather than the ambient ones: conftest lowers
+    # the log level, and a developer's `.env` would otherwise leak in here.
     monkeypatch.delenv("AURA_LOG_LEVEL", raising=False)
     monkeypatch.delenv("AURA_DATABASE_URL", raising=False)
     monkeypatch.delenv("AURA_ENVIRONMENT", raising=False)
 
-    settings = Settings()
+    settings = Settings(_env_file=None)
 
     assert settings.PROJECT_NAME == "aura-gateway"
     assert settings.DEBUG is False
