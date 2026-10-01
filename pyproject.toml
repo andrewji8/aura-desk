@@ -1,0 +1,143 @@
+# Monorepo root aggregator for aura-desk.
+#
+# NOTE ON STYLE: metadata and the dependency list live in the PEP 621
+# `[project]` table. The local path sources for workspace members stay in
+# `[tool.poetry.dependencies]` because PEP 508 strings cannot express a
+# relative path; every name listed there must also appear in
+# `[project].dependencies` or Poetry drops the entry.
+#
+# NOTE ON WORKSPACES: Poetry 2.1.3 has no `workspace` table (verified against
+# poetry-core's bundled poetry-schema.json, zero matches). Workspace members
+# are composed with `path` dependencies, which yields one poetry.lock and one
+# virtualenv for the whole repo. `develop = true` is still the current key for
+# editable installs; `editable = true` is rejected by the schema.
+[project]
+name = "aura-desk"
+version = "0.1.0"
+description = "AI virtual-human customer-service platform monorepo"
+authors = [{ name = "Aura Desk Platform Team", email = "platform@aura-desk.io" }]
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    # Workspace members. PEP 508 cannot express a relative path, so each name
+    # is declared here and its path source is supplied by
+    # `[tool.poetry.dependencies]` below. Poetry 2.x treats `[project].dependencies`
+    # as the authoritative list and drops any `tool.poetry.dependencies` entry
+    # whose name is missing from it, which silently unlinks the members.
+    "aura-common",
+    "aura-schemas",
+    "aura-gateway",
+    # Global runtime stack.
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.32,<1.0",
+    "pydantic>=2.9,<3.0",
+    "pydantic-settings>=2.6,<3.0",
+    "sqlalchemy[asyncio]>=2.0.36,<3.0",
+    "asyncpg>=0.30,<1.0",
+    "alembic>=1.14,<2.0",
+    "structlog>=24.4,<26.0",
+    "httpx>=0.27,<1.0",
+    "anyio>=4.6,<5.0",
+]
+
+[tool.poetry]
+# The root is an aggregator only; it is never built or published.
+package-mode = false
+
+[tool.poetry.dependencies]
+# Workspace members. Adding a new member is a one-line change here.
+aura-common = { path = "packages/common", develop = true }
+aura-schemas = { path = "packages/schemas", develop = true }
+aura-gateway = { path = "apps/gateway", develop = true }
+
+[tool.poetry.group.dev.dependencies]
+ruff = ">=0.8,<1.0"
+mypy = ">=1.13,<2.0"
+
+[tool.poetry.group.test.dependencies]
+pytest = ">=8.3,<9.0"
+pytest-asyncio = ">=0.24,<1.0"
+pytest-cov = ">=6.0,<7.0"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["apps", "packages"]
+extend-exclude = [".venv", "**/dist", "**/build", "**/.mypy_cache", "**/.pytest_cache"]
+
+[tool.ruff.lint]
+select = [
+    "F",      # pyflakes
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # bugbear
+    "A",      # builtin shadowing
+    "C4",     # comprehensions
+    "DTZ",    # naive datetimes
+    "T20",    # print() in library code
+    "SIM",    # simplify
+    "PTH",    # pathlib
+    "RUF",    # ruff-specific
+    "S",      # bandit
+    "ASYNC",  # blocking calls in async context
+    "G",      # logging format
+    "PIE",    # misc lints
+    "TC",     # type-checking imports
+    "PERF",   # perflint
+    "ARG",    # unused arguments
+]
+ignore = [
+    "E501",    # line length is owned by the formatter
+    "B008",    # FastAPI Depends() in defaults is idiomatic
+    "S101",    # assert is allowed in tests
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["ARG", "S", "PLR2004", "B011"]
+"**/__init__.py" = ["F401"]
+"**/conftest.py" = ["S"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["aura_common", "aura_schemas", "aura_gateway"]
+combine-as-imports = true
+force-sort-within-sections = true
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.pylint]
+max-args = 8
+max-branches = 12
+
+[tool.ruff.format]
+docstring-code-format = true
+line-ending = "lf"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["apps", "packages"]
+addopts = "-ra --strict-markers --strict-config --cov --cov-report=term-missing --cov-report=xml"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+# Coverage targets are declared here rather than via `--cov=a,b,c`: pytest-cov
+# passes that comma-joined string to coverage as a single module name, which
+# silently yields "module never imported" and an empty report.
+[tool.coverage.run]
+branch = true
+source = [
+    "apps/gateway/src/aura_gateway",
+    "packages/common/src/aura_common",
+    "packages/schemas/src/aura_schemas",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

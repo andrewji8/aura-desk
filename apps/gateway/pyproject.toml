@@ -1,0 +1,40 @@
+# Edge gateway: session orchestration, streaming transport and auth.
+#
+# Metadata is declared with PEP 621. Local workspace packages cannot be written
+# as PEP 508 strings, so their path sources stay in `[tool.poetry.dependencies]`
+# and `develop = true` installs them editable. Poetry 2.1.3 rejects
+# `editable = true` (poetry-core's `path-dependency` schema only allows
+# `develop`), so `develop` is still the current spelling.
+[project]
+name = "aura-gateway"
+version = "0.1.0"
+description = "Edge gateway: session orchestration, streaming transport and auth for aura-desk"
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+license = { text = "Proprietary" }
+authors = [{ name = "Aura Desk Platform Team", email = "platform@aura-desk.io" }]
+dependencies = [
+    "aura-common",
+    "aura-schemas",
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.32,<1.0",
+    "pydantic>=2.9,<3.0",
+    "pydantic-settings>=2.6,<3.0",
+    "structlog>=24.4,<26.0",
+    "httpx>=0.27,<1.0",
+    "anyio>=4.6,<5.0",
+]
+
+[project.scripts]
+aura-gateway = "aura_gateway.__main__:main"
+
+[tool.poetry]
+# No explicit `packages`: Poetry auto-detects the src/ layout (src/aura_gateway).
+
+[tool.poetry.dependencies]
+aura-common = { path = "../../packages/common", develop = true }
+aura-schemas = { path = "../../packages/schemas", develop = true }
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

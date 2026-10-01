@@ -1,0 +1,16 @@
+[project]
+name = "aura-schemas"
+version = "0.1.0"
+description = "Shared Pydantic contracts and event schemas for aura-desk services"
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+license = { text = "Proprietary" }
+authors = [{ name = "Aura Desk Platform Team", email = "platform@aura-desk.io" }]
+dependencies = ["pydantic>=2.9,<3.0"]
+
+[tool.poetry]
+# No explicit `packages`: Poetry auto-detects the src/ layout (src/aura_schemas).
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
