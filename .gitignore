@@ -1,12 +1,32 @@
+# Python 虚拟环境
+.venv/
+venv/
+env/
+
+# 环境变量文件 (绝对不要提交包含真实 API Key 的 .env)
+.env
+.env.local
+
+# Python 缓存
 __pycache__/
 *.py[cod]
-.venv/
-dist/
-build/
-*.egg-info/
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
+*$py.class
+*.so
+
+# 测试与覆盖率
 .coverage
-coverage.xml
-.env
+htmlcov/
+.pytest_cache/
+
+# IDE 配置 (可选，根据个人习惯)
+.vscode/
+.idea/
+
+# 本地数据库文件 (如果使用 SQLite)
+*.db
+*.sqlite
+*.sqlite3
+
+# OS 文件
+.DS_Store
+Thumbs.db

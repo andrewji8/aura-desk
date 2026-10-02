@@ -13,15 +13,20 @@ from aura_schemas.ws import MAX_AUDIO_FRAME_BYTES
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    import httpx
+
 WS_URL = "/ws/virtual-human/s-test"
 
 
 @pytest.fixture
-def ws_client() -> Iterator[TestClient]:
+def ws_client(mock_llm: httpx.AsyncClient) -> Iterator[TestClient]:
     """Yield a test client whose lifespan is running but socket is not yet open."""
+    from aura_gateway.core.llm import set_llm_client
     from aura_gateway.main import app
 
     with TestClient(app) as test_client:
+        # The lifespan installs a real client on entry; restore the mock.
+        set_llm_client(mock_llm)
         yield test_client
 
 

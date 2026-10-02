@@ -20,6 +20,7 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from aura_gateway.core.llm import get_llm_client
 from aura_gateway.core.logging import (
     bind_request_context,
     clear_request_context,
@@ -249,7 +250,9 @@ async def virtual_human_socket(websocket: WebSocket, session_id: str) -> None:
     request_id = new_request_id()
     bind_request_context(request_id, session_id=session_id)
     log = _log.bind(session_id=session_id, request_id=request_id)
-    pipeline = StreamingPipeline(session_id)
+    # The HTTP client is shared process-wide so pooled connections are reused
+    # across sessions instead of being rebuilt per turn.
+    pipeline = StreamingPipeline(session_id, client=get_llm_client())
 
     await websocket.accept()
     log.info("ws.connected", path=websocket.url.path)

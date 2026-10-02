@@ -10,7 +10,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Annotated, Literal, Self
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 __all__ = ["Environment", "Settings", "get_settings"]
@@ -68,6 +68,26 @@ class Settings(BaseSettings):
     LOG_ACCESS: bool = True
     REQUEST_ID_HEADER: str = "X-Request-ID"
 
+    # ---- LLM (OpenAI-compatible: DeepSeek / Zhipu / local vLLM) -------------
+    # ``LLM_API_KEY`` is a SecretStr so it is masked in logs, tracebacks and
+    # ``repr(Settings)``; call ``.get_secret_value()`` only at the request site.
+    LLM_API_KEY: SecretStr = SecretStr("")
+    LLM_BASE_URL: str = "https://api.deepseek.com/v1"
+    LLM_MODEL: str = "deepseek-chat"
+    LLM_SYSTEM_PROMPT: str = (
+        "你是 Aura Desk 的虚拟客服助手. 请用简洁、自然的中文回答, 不要输出 Markdown 标题或表情符号."
+    )
+    LLM_TEMPERATURE: float = Field(default=0.7, ge=0.0, le=2.0)
+    LLM_MAX_TOKENS: int = Field(default=512, ge=1, le=32_768)
+    LLM_TIMEOUT_CONNECT: float = Field(default=5.0, gt=0, le=120)
+    LLM_TIMEOUT_READ: float = Field(default=60.0, gt=0, le=600)
+    # Bounded retry for rate limits and transient upstream errors. Retries only
+    # apply before the first token is emitted, so a reply is never duplicated.
+    LLM_MAX_RETRIES: int = Field(default=2, ge=0, le=5)
+    LLM_RETRY_BACKOFF: float = Field(default=0.5, ge=0, le=30)
+    # Shared connection pool for the process-wide AsyncClient.
+    LLM_MAX_CONNECTIONS: int = Field(default=100, ge=1, le=1_000)
+
     # ---- CORS -----------------------------------------------------------------
     # ``NoDecode`` keeps pydantic-settings from JSON-parsing the raw environment
     # value; the validator below splits the comma-separated list instead.
@@ -107,6 +127,33 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         return value.strip()
 
+    @field_validator("LLM_BASE_URL", mode="after")
+    @classmethod
+    def _normalize_llm_base_url(cls, value: str) -> str:
+        """Validate the upstream base URL and drop any trailing slash.
+
+        Joining a pre-trimmed base URL with ``/chat/completions`` is what keeps
+        a trailing slash from producing a double slash that some proxies reject.
+        """
+        normalized = value.strip().rstrip("/")
+        if not normalized:
+            msg = "AURA_LLM_BASE_URL must not be empty"
+            raise ValueError(msg)
+        scheme = normalized.split("://", maxsplit=1)[0].lower()
+        if scheme not in {"http", "https"}:
+            msg = f"AURA_LLM_BASE_URL must use http or https, got {value!r}"
+            raise ValueError(msg)
+        return normalized
+
+    @field_validator("LLM_MODEL", mode="after")
+    @classmethod
+    def _normalize_llm_model(cls, value: str) -> str:
+        """Reject a blank model name, which the upstream would reject anyway."""
+        if not value.strip():
+            msg = "AURA_LLM_MODEL must not be empty"
+            raise ValueError(msg)
+        return value.strip()
+
     @model_validator(mode="after")
     def _validate_runtime_combinations(self) -> Self:
         """Reject cross-field combinations that cannot produce a working app."""
@@ -129,7 +176,32 @@ class Settings(BaseSettings):
             msg = "CORS_ALLOW_CREDENTIALS must be false when CORS_ORIGINS contains '*'"
             raise ValueError(msg)
 
+        # Plain HTTP is tolerated for a loopback vLLM, but must never reach a
+        # remote host, where the API key would cross the network in clear text.
+        if (
+            self.is_production
+            and self.LLM_BASE_URL.startswith("http://")
+            and not self.LLM_BASE_URL.startswith(("http://127.0.0.1", "http://localhost"))
+        ):
+            msg = "AURA_LLM_BASE_URL must use https outside localhost in prod"
+            raise ValueError(msg)
+
         return self
+
+    @property
+    def llm_configured(self) -> bool:
+        """Whether an API key is present.
+
+        A local vLLM deployment may legitimately run without one, so this is
+        informational: the pipeline refuses to call the upstream only when the
+        key is missing *and* the endpoint is remote.
+        """
+        return bool(self.LLM_API_KEY.get_secret_value())
+
+    @property
+    def llm_chat_completions_url(self) -> str:
+        """Absolute URL of the OpenAI-compatible chat completions endpoint."""
+        return f"{self.LLM_BASE_URL}/chat/completions"
 
     @property
     def is_production(self) -> bool:

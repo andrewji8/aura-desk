@@ -25,7 +25,7 @@ async def test_virtual_human_pipeline():
         # 2. 接收流式响应
         print("\n👂 [Client] 开始接收流式响应:")
         try:
-            async with asyncio.timeout(6.0): # 稍微延长超时，确保能收到完整 Mock 回复
+            async with asyncio.timeout(20.0): # 稍微延长超时，确保能收到完整 Mock 回复
                 async for message in ws:
                     # 【关键修复】：区分二进制帧和文本帧
                     if isinstance(message, bytes):

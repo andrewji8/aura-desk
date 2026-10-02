@@ -1,19 +1,21 @@
-"""Mock ASR -> LLM -> TTS streaming pipeline.
+"""Real LLM / TTS streaming pipeline.
 
 The pipeline is a bounded-buffer producer/consumer stage::
 
     Receiver (websocket) -> input_queue -> process_stream -> output_queue -> Sender (websocket)
 
-Running the stages as separate tasks decouples socket reads from model
-latency: a slow client cannot stall generation, and a fast generator cannot
-block the receive loop.
+Running the stages as separate tasks decouples socket reads from model latency:
+a slow client cannot stall generation, and a fast generator cannot block the
+receive loop.
 
-The AI stages are simulated with :func:`asyncio.sleep` and async generators, so
-the whole link is exercisable without an external AI provider. Every ``await``
-is a cancellation point, which is what makes barge-in fast:
-:meth:`StreamingPipeline.handle_interrupt` drains the output queue and cancels
-the processing task, so the in-flight generator is torn down at its next
-suspension point instead of being awaited to completion.
+Text generation is a real call to an OpenAI-compatible endpoint
+(:meth:`StreamingPipeline._real_llm_stream`) driven by ``httpx.AsyncClient``
+streaming SSE. Every ``await`` is a cancellation point, which is what makes
+barge-in fast: :meth:`StreamingPipeline.handle_interrupt` drains the output queue
+and cancels the processing task, so the in-flight HTTP stream is torn down at its
+next suspension point instead of being awaited to completion.
+
+ASR and TTS are still simulated; only the text stage talks to a real model.
 """
 
 from __future__ import annotations
@@ -21,8 +23,12 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final
+import json
+from typing import TYPE_CHECKING, Any, Final
 
+import httpx
+
+from aura_gateway.core.config import Settings, get_settings
 from aura_gateway.core.logging import get_logger
 from aura_schemas.ws import (
     MAX_AUDIO_FRAME_BYTES,
@@ -43,7 +49,16 @@ from aura_schemas.ws import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-__all__ = ["InboundItem", "PipelineItem", "StreamingPipeline"]
+__all__ = [
+    "InboundItem",
+    "LLMError",
+    "LLMProtocolError",
+    "LLMRateLimitError",
+    "LLMTimeoutError",
+    "LLMUpstreamError",
+    "PipelineItem",
+    "StreamingPipeline",
+]
 
 #: Sentinel pushed onto ``input_queue`` to ask the processor to return cleanly.
 SHUTDOWN: Final = object()
@@ -51,17 +66,67 @@ SHUTDOWN: Final = object()
 #: Mock stage latencies in seconds. Deliberately short so a full round trip
 #: finishes inside a test, yet non-zero to keep cancellation observable.
 ASR_LATENCY: Final = 0.02
-LLM_TOKEN_INTERVAL: Final = 0.01
 TTS_CHUNK_INTERVAL: Final = 0.01
 
 #: Size of one mock TTS chunk, and how many characters of text produce one.
 TTS_CHUNK_BYTES: Final = 1_024
 TTS_CHUNK_CHARS: Final = 6
 
-#: Deterministic mock reply, split into tokens so the deltas read naturally.
-#: Written with ASCII punctuation on purpose: the project's Ruff config rejects
-#: ambiguous full-width characters (RUF001).
-MOCK_REPLY: Final = "您好, 我是 Aura 虚拟助手, 很高兴为您服务. 请问有什么可以帮您?"
+#: SSE framing constants for the OpenAI-compatible streaming protocol.
+_SSE_DATA_PREFIX: Final = "data:"
+_SSE_DONE_MARKER: Final = "[DONE]"
+
+#: Upstream status codes worth another attempt: rate limiting and transient
+#: server-side failures.
+_RETRYABLE_STATUS: Final = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+#: Default chat history handed to the model when no conversation is tracked yet.
+_SYSTEM_ROLE: Final = "system"
+_USER_ROLE: Final = "user"
+_ASSISTANT_ROLE: Final = "assistant"
+
+
+class LLMError(Exception):
+    """Base class for upstream LLM failures that must reach the client.
+
+    Raising this instead of letting ``httpx`` errors escape keeps the pipeline
+    from crashing while guaranteeing the client is told what happened.
+    """
+
+    def __init__(self, message: str, *, code: str = "llm_error", retryable: bool = False) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.retryable = retryable
+
+
+class LLMTimeoutError(LLMError):
+    """The upstream did not answer within the configured timeout."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="llm_timeout", retryable=True)
+
+
+class LLMRateLimitError(LLMError):
+    """The upstream rejected the request with HTTP 429."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="llm_rate_limited", retryable=True)
+
+
+class LLMUpstreamError(LLMError):
+    """The upstream returned an unexpected non-success status code."""
+
+    def __init__(self, message: str, *, status_code: int, retryable: bool) -> None:
+        super().__init__(message, code=f"llm_upstream_{status_code}", retryable=retryable)
+        self.status_code = status_code
+
+
+class LLMProtocolError(LLMError):
+    """The upstream sent a frame that does not match the streaming protocol."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="llm_protocol_error")
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,13 +160,17 @@ class StreamingPipeline:
 
     An instance owns the queues and the task running :meth:`process_stream` for
     exactly one session, so concurrency scales per session and no state is
-    shared between sessions.
+    shared between sessions. The HTTP client may be shared across sessions: an
+    ``httpx.AsyncClient`` is safe to use concurrently and connection pooling is
+    only effective when the client outlives a single request.
     """
 
     def __init__(
         self,
         session_id: str,
         *,
+        client: httpx.AsyncClient | None = None,
+        settings: Settings | None = None,
         input_queue_size: int = 32,
         output_queue_size: int = 64,
     ) -> None:
@@ -109,6 +178,10 @@ class StreamingPipeline:
 
         Args:
             session_id: Correlation id attached to every log line and frame.
+            client: Shared ``httpx.AsyncClient``. When omitted, the process-wide
+                client from the lifespan is used; injecting one keeps tests off
+                the network.
+            settings: Configuration override, mainly for tests.
             input_queue_size: Buffered inbound items before the receiver applies
                 backpressure to the socket.
             output_queue_size: Buffered outbound items before generation blocks,
@@ -121,10 +194,13 @@ class StreamingPipeline:
         self.output_queue: asyncio.Queue[PipelineItem | object] = asyncio.Queue(
             maxsize=output_queue_size,
         )
+        self._settings = settings or get_settings()
+        self._client = client
         self._task: asyncio.Task[None] | None = None
         self._log = get_logger("aura_gateway.pipeline").bind(session_id=session_id)
         self._interrupted = False
         self._turn = 0
+        self._history: list[dict[str, str]] = []
 
     @property
     def task(self) -> asyncio.Task[None] | None:
@@ -185,7 +261,9 @@ class StreamingPipeline:
         """Execute a barge-in: drop queued output and cancel active generation.
 
         The output queue is emptied first so the client stops hearing audio as
-        early as possible, and only then is generation cancelled.
+        early as possible, and only then is generation cancelled. The
+        in-flight HTTP request is aborted by cancelling its task, which closes
+        the response stream and releases the connection.
 
         Args:
             message: The validated interrupt frame, used for log detail.
@@ -214,6 +292,9 @@ class StreamingPipeline:
             keep_context=keep_context,
             generation_cancelled=cancelled,
         )
+        if not keep_context:
+            self._history.clear()
+            self._log.info("pipeline.context_cleared")
         await self._emit_status(PipelineStatus.INTERRUPTED, detail=reason)
         return dropped
 
@@ -277,7 +358,7 @@ class StreamingPipeline:
             raise ValueError(msg)
         await self.submit(InboundItem(message=message, audio=audio))
 
-    # ---- mock AI stages ----------------------------------------------------
+    # ---- mock ASR / TTS stages ---------------------------------------------
 
     async def _mock_asr(self, audio: bytes) -> str:
         """Simulate speech recognition of one audio frame.
@@ -293,20 +374,6 @@ class StreamingPipeline:
         self._log.info("pipeline.asr_completed", audio_bytes=len(audio))
         return f"模拟语音输入({len(audio)} 字节)"
 
-    async def _mock_llm_stream(self, prompt: str) -> AsyncIterator[str]:
-        """Yield the assistant reply one token at a time.
-
-        Mirrors the cadence of a real streaming model, and makes the surrounding
-        task cancellable between tokens.
-
-        Args:
-            prompt: Recognised user text; unused by the mock.
-        """
-        del prompt  # a real implementation would condition generation on it
-        for token in MOCK_REPLY:
-            await asyncio.sleep(LLM_TOKEN_INTERVAL)
-            yield token
-
     async def _mock_tts_stream(self, text: str) -> AsyncIterator[bytes]:
         """Yield synthesized speech as fixed-size chunks.
 
@@ -320,6 +387,251 @@ class StreamingPipeline:
         for _ in range(chunk_count):
             await asyncio.sleep(TTS_CHUNK_INTERVAL)
             yield bytes(TTS_CHUNK_BYTES)
+
+    # ---- real LLM stage -----------------------------------------------------
+
+    def _build_headers(self) -> dict[str, str]:
+        """Build the outbound request headers for the upstream call."""
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        api_key = self._settings.LLM_API_KEY.get_secret_value()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    def _build_request_body(self, prompt: str) -> dict[str, Any]:
+        """Build the OpenAI-compatible chat completions request body."""
+        settings = self._settings
+        messages: list[dict[str, str]] = [
+            {"role": _SYSTEM_ROLE, "content": settings.LLM_SYSTEM_PROMPT},
+            *self._history,
+            {"role": _USER_ROLE, "content": prompt},
+        ]
+        return {
+            "model": settings.LLM_MODEL,
+            "messages": messages,
+            "stream": True,
+            "temperature": settings.LLM_TEMPERATURE,
+            "max_tokens": settings.LLM_MAX_TOKENS,
+        }
+
+    def _request_timeout(self) -> httpx.Timeout:
+        """Return the connect/read timeout pair for one streaming request."""
+        return httpx.Timeout(
+            timeout=self._settings.LLM_TIMEOUT_READ,
+            connect=self._settings.LLM_TIMEOUT_CONNECT,
+        )
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Return the HTTP client used for generation.
+
+        Raises:
+            LLMError: If no client was injected and the application lifespan has
+                not installed the shared one yet.
+        """
+        if self._client is None:
+            from aura_gateway.core.llm import get_llm_client
+
+            self._client = get_llm_client()
+        return self._client
+
+    @staticmethod
+    def _error_message_from_payload(payload: object) -> str | None:
+        """Extract the upstream's human-readable error message, if present."""
+        if not isinstance(payload, dict):
+            return None
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message:
+                return message[:500]
+        return None
+
+    @staticmethod
+    def _raise_for_status(status_code: int, body: str) -> None:
+        """Translate a non-success HTTP status into a typed :class:`LLMError`.
+
+        Args:
+            status_code: Status returned by the upstream.
+            body: Raw response body, parsed for a provider error message.
+
+        Raises:
+            LLMRateLimitError: On HTTP 429.
+            LLMUpstreamError: On any other non-success status.
+        """
+        detail = (
+            StreamingPipeline._error_message_from_payload(
+                _try_json(body),
+            )
+            or f"upstream returned HTTP {status_code}"
+        )
+        if status_code == 429:
+            raise LLMRateLimitError(detail)
+        raise LLMUpstreamError(
+            detail,
+            status_code=status_code,
+            retryable=status_code in _RETRYABLE_STATUS,
+        )
+
+    @staticmethod
+    def _extract_delta(frame: str) -> str | None:
+        """Return the text delta carried by one SSE ``data:`` payload.
+
+        Args:
+            frame: The raw payload following ``data:``.
+
+        Returns:
+            The incremental text, an empty string for a keep-alive chunk, or
+            ``None`` when the frame carries no ``choices`` array (for example a
+            final usage-only frame).
+
+        Raises:
+            LLMProtocolError: If the payload is not a JSON object, or its
+                ``choices`` entry cannot be interpreted.
+        """
+        payload = _try_json(frame)
+        if not isinstance(payload, dict):
+            msg = f"expected a JSON object in SSE data, got {frame[:200]!r}"
+            raise LLMProtocolError(msg)
+
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return None
+        first = choices[0]
+        if not isinstance(first, dict):
+            msg = f"expected a choice object, got {type(first).__name__}"
+            raise LLMProtocolError(msg)
+
+        delta = first.get("delta")
+        if not isinstance(delta, dict):
+            return None
+        content = delta.get("content")
+        if content is None:
+            return None
+        if not isinstance(content, str):
+            msg = f"delta content must be a string, got {type(content).__name__}"
+            raise LLMProtocolError(msg)
+        return content
+
+    async def _real_llm_stream(self, prompt: str) -> AsyncIterator[str]:
+        """Stream the assistant reply from an OpenAI-compatible endpoint.
+
+        Issues ``POST {LLM_BASE_URL}/chat/completions`` with ``stream: true`` and
+        parses the Server-Sent Events response, yielding each text delta as it
+        arrives so the client sees tokens as early as the upstream produces
+        them.
+
+        The request is retried on rate limits and transient upstream errors, but
+        *only* while no delta has been emitted yet; retrying mid-stream would
+        duplicate text the client already received.
+
+        Args:
+            prompt: The recognised or typed user utterance.
+
+        Yields:
+            Successive text deltas, possibly empty strings for keep-alive frames.
+
+        Raises:
+            LLMTimeoutError: The upstream did not respond in time.
+            LLMRateLimitError: The upstream rate-limited every attempt.
+            LLMUpstreamError: The upstream returned an unexpected status.
+            LLMProtocolError: The upstream sent a malformed SSE frame.
+        """
+        settings = self._settings
+        headers = self._build_headers()
+        body = self._build_request_body(prompt)
+        url = settings.llm_chat_completions_url
+        last_error: LLMError | None = None
+
+        for attempt in range(settings.LLM_MAX_RETRIES + 1):
+            emitted = False
+            try:
+                async for delta in self._stream_once(url, headers, body):
+                    emitted = True
+                    yield delta
+                return
+            except httpx.TimeoutException as exc:
+                last_error = LLMTimeoutError(f"LLM request timed out: {exc.__class__.__name__}")
+            except httpx.HTTPError as exc:
+                last_error = LLMUpstreamError(
+                    f"LLM transport error: {exc.__class__.__name__}",
+                    status_code=0,
+                    retryable=True,
+                )
+            except LLMError as exc:
+                last_error = exc
+
+            self._log.warning(
+                "pipeline.llm_attempt_failed",
+                attempt=attempt + 1,
+                code=last_error.code,
+                error=last_error.message,
+                emitted=emitted,
+            )
+            # A failure after tokens were emitted cannot be retried safely.
+            if emitted or not last_error.retryable or attempt >= settings.LLM_MAX_RETRIES:
+                raise last_error
+            await asyncio.sleep(settings.LLM_RETRY_BACKOFF * (2**attempt))
+
+    async def _stream_once(
+        self,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+    ) -> AsyncIterator[str]:
+        """Perform one streaming request and yield its text deltas.
+
+        Args:
+            url: Absolute chat completions URL.
+            headers: Request headers including authorization.
+            body: JSON request body.
+
+        Yields:
+            Text deltas decoded from the SSE stream.
+
+        Raises:
+            LLMRateLimitError: On HTTP 429.
+            LLMUpstreamError: On any other non-success status.
+            LLMProtocolError: On a malformed SSE frame.
+            httpx.TimeoutException: On connect/read timeout.
+        """
+        client = self._get_client()
+        self._log.info(
+            "pipeline.llm_request_started",
+            model=self._settings.LLM_MODEL,
+            base_url=self._settings.LLM_BASE_URL,
+        )
+
+        async with client.stream(
+            "POST",
+            url,
+            headers=headers,
+            json=body,
+            timeout=self._request_timeout(),
+        ) as response:
+            if response.status_code != 200:
+                raw = await response.aread()
+                self._raise_for_status(response.status_code, raw.decode("utf-8", "replace"))
+
+            delta_count = 0
+            async for line in response.aiter_lines():
+                if not line or line.startswith(":"):
+                    continue  # keep-alive / SSE comment
+                if not line.startswith(_SSE_DATA_PREFIX):
+                    continue
+                frame = line[len(_SSE_DATA_PREFIX) :].strip()
+                if not frame:
+                    continue
+                if frame == _SSE_DONE_MARKER:
+                    self._log.info("pipeline.llm_stream_done", deltas=delta_count)
+                    return
+
+                delta = self._extract_delta(frame)
+                if delta:
+                    delta_count += 1
+                    yield delta
 
     # ---- processor ---------------------------------------------------------
 
@@ -370,6 +682,10 @@ class StreamingPipeline:
     ) -> None:
         """Handle a single client message end to end.
 
+        An upstream failure is reported to the client as an error frame and ends
+        the turn normally, so the session survives a rate limit or a bad frame
+        without the processor task dying.
+
         Args:
             session_id: Session correlation id for emitted frames.
             item: The validated client message and its optional audio.
@@ -396,21 +712,44 @@ class StreamingPipeline:
 
         sequence = 0
         parts: list[str] = []
-        async for token in self._mock_llm_stream(prompt):
-            parts.append(token)
-            await output_queue.put(
-                PipelineItem(
-                    message=build_server_message(
-                        ServerMessageType.TEXT_DELTA,
-                        session_id,
-                        sequence=sequence,
-                        text=TextPayload(text=token, final=False),
+        try:
+            async for delta in self._real_llm_stream(prompt):
+                parts.append(delta)
+                await output_queue.put(
+                    PipelineItem(
+                        message=build_server_message(
+                            ServerMessageType.TEXT_DELTA,
+                            session_id,
+                            sequence=sequence,
+                            text=TextPayload(text=delta, final=False),
+                        ),
                     ),
-                ),
+                )
+                sequence += 1
+        except LLMError as exc:
+            # Graceful degradation: tell the client, then end the turn. The
+            # processor stays alive for the next message.
+            self._log.warning(
+                "pipeline.llm_failed",
+                turn=self._turn,
+                code=exc.code,
+                error=exc.message,
             )
-            sequence += 1
+            await self._emit_error(exc.code, exc.message, fatal=False)
+            await self._emit_status(PipelineStatus.LISTENING, detail="llm_error")
+            return
 
         full_reply = "".join(parts)
+        if not full_reply:
+            await self._emit_error("llm_empty_response", "LLM returned no content", fatal=False)
+            return
+
+        self._history.extend(
+            (
+                {"role": _USER_ROLE, "content": prompt},
+                {"role": _ASSISTANT_ROLE, "content": full_reply},
+            ),
+        )
         await output_queue.put(
             PipelineItem(
                 message=build_server_message(
@@ -451,3 +790,21 @@ class StreamingPipeline:
         """Queue a terminal error frame, used when a turn cannot be processed."""
         self._log.error("pipeline.turn_failed", code=code)
         await self._emit_error(code, message, fatal=True)
+
+
+def _try_json(raw: str) -> Any:
+    """Decode JSON, returning ``None`` instead of raising on malformed input.
+
+    Used on error bodies and SSE frames, where a non-JSON payload is a normal
+    occurrence to be reported rather than a crash.
+
+    Args:
+        raw: Candidate JSON text.
+
+    Returns:
+        The decoded value, or ``None`` when the text is not valid JSON.
+    """
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return None

@@ -70,3 +70,50 @@ def test_resolve_request_id_generates_when_missing() -> None:
     generated = _resolve_request_id(None)
 
     assert len(generated) == len(new_request_id())
+
+
+# ---- LLM configuration -----------------------------------------------------
+
+
+def test_llm_url_is_built_from_base() -> None:
+    settings = Settings(_env_file=None, LLM_BASE_URL="https://api.deepseek.com/v1/")
+
+    assert settings.llm_chat_completions_url == "https://api.deepseek.com/v1/chat/completions"
+
+
+def test_llm_base_url_must_be_http_or_https() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, LLM_BASE_URL="ftp://example.com")
+
+
+def test_llm_base_url_must_not_be_empty() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, LLM_BASE_URL="   ")
+
+
+def test_llm_model_must_not_be_empty() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, LLM_MODEL=" ")
+
+
+def test_production_rejects_plaintext_remote_llm_url() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, ENVIRONMENT="prod", LLM_BASE_URL="http://llm.example.com/v1")
+
+
+def test_production_allows_loopback_plaintext_llm_url() -> None:
+    settings = Settings(_env_file=None, ENVIRONMENT="prod", LLM_BASE_URL="http://localhost:8000/v1")
+
+    assert settings.llm_chat_completions_url == "http://localhost:8000/v1/chat/completions"
+
+
+def test_llm_api_key_is_masked_in_repr() -> None:
+    settings = Settings(_env_file=None, LLM_API_KEY="sk-super-secret")
+
+    assert "sk-super-secret" not in repr(settings)
+    assert settings.LLM_API_KEY.get_secret_value() == "sk-super-secret"
+    assert settings.llm_configured is True
+
+
+def test_llm_api_key_defaults_to_unset() -> None:
+    assert Settings(_env_file=None).llm_configured is False
