@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Aura Desk · Virtual Human Client</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* =========================================================
+       Avatar state animations
+       - idle / listen : subtle breathing
+       - think        : 360° spin + pulse
+       - speak        : fast scale bounce (voice wave)
+       ========================================================= */
+    @keyframes avatar-idle {
+      0%, 100% { transform: scale(1) translateY(0); }
+      50%      { transform: scale(1.04) translateY(-2px); }
+    }
+    @keyframes avatar-think {
+      0%   { transform: rotate(0deg)   scale(1); }
+      50%  { transform: rotate(180deg) scale(1.12); }
+      100% { transform: rotate(360deg) scale(1); }
+    }
+    @keyframes avatar-speak {
+      0%, 100% { transform: scale(1); }
+      25%      { transform: scale(1.18); }
+      75%      { transform: scale(0.94); }
+    }
+    @keyframes cursor-blink {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: 0; }
+    }
+
+    .avatar-idle  { animation: avatar-idle  3s ease-in-out infinite; }
+    .avatar-think { animation: avatar-think 1.2s linear infinite; }
+    .avatar-speak { animation: avatar-speak 0.45s ease-in-out infinite; }
+
+    /* Blinking cursor appended after the streaming text delta */
+    .typing-cursor::after {
+      content: '▍';
+      color: #60a5fa;
+      animation: cursor-blink 0.9s step-end infinite;
+      margin-left: 1px;
+    }
+
+    /* Scrollbar styling for chat area */
+    #chat::-webkit-scrollbar { width: 6px; }
+    #chat::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+
+    /* Disable text selection on PTT button (touch devices) */
+    #ptt-btn { user-select: none; -webkit-user-select: none; touch-action: manipulation; }
+  </style>
+</head>
+
+<body class="bg-gray-950 text-gray-100 h-screen flex flex-col overflow-hidden">
+
+  <!-- ============================================================
+       TOP — Avatar + status badge
+       ============================================================ -->
+  <header class="flex-shrink-0 flex flex-col items-center pt-6 pb-3 select-none">
+    <!-- Avatar: state class is swapped by setAvatar() -->
+    <div id="avatar" class="avatar-idle text-7xl leading-none transition-colors duration-300">
+      🤖
+    </div>
+    <div class="mt-3 flex items-center gap-2">
+      <span id="status-dot" class="inline-block w-2.5 h-2.5 rounded-full bg-gray-500"></span>
+      <span id="status-badge" class="px-3 py-0.5 rounded-full bg-gray-800 text-sm text-gray-300 border border-gray-700">
+        Idle
+      </span>
+    </div>
+    <p id="session-label" class="mt-1 text-xs text-gray-600 font-mono"></p>
+  </header>
+
+  <!-- ============================================================
+       MIDDLE — Chat history
+       ============================================================ -->
+  <main id="chat" class="flex-1 overflow-y-auto px-4 pb-4 space-y-3">
+    <!-- Messages are appended here dynamically. -->
+    <div class="text-center text-gray-600 text-sm mt-8">
+      <p>👋 你好！我是 Aura 虚拟助手。</p>
+      <p class="mt-1">输入文字或按住下方麦克风开始对话。</p>
+    </div>
+  </main>
+
+  <!-- ============================================================
+       BOTTOM — Input controls + debug log
+       ============================================================ -->
+  <footer class="flex-shrink-0 border-t border-gray-800 bg-gray-900/80 backdrop-blur p-4 space-y-3">
+    <!-- Text input -->
+    <div class="flex items-center gap-2">
+      <input
+        id="text-input"
+        type="text"
+        placeholder="输入消息..."
+        autocomplete="off"
+        class="flex-1 bg-gray-800 border border-gray-700 rounded-xl px-4 py-2.5 text-sm
+               focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent
+               placeholder-gray-500"
+      />
+      <button
+        id="send-btn"
+        class="bg-blue-600 hover:bg-blue-500 active:scale-95 transition px-5 py-2.5 rounded-xl text-sm font-medium"
+      >
+        发送
+      </button>
+    </div>
+
+    <!-- Push-to-talk -->
+    <button
+      id="ptt-btn"
+      class="w-full bg-red-950/60 border-2 border-red-800 text-red-300 py-3 rounded-xl
+             text-sm font-medium active:bg-red-700 active:text-white active:border-red-500
+             transition-colors"
+    >
+      🎤 按住说话
+    </button>
+
+    <!-- Debug log (collapsible) -->
+    <details class="text-xs text-gray-500">
+      <summary class="cursor-pointer hover:text-gray-300 transition">调试日志</summary>
+      <pre id="log" class="mt-2 h-28 overflow-y-auto bg-gray-950 rounded-lg p-2 font-mono whitespace-pre-wrap break-all"></pre>
+    </details>
+  </footer>
+
+  <!-- ============================================================
+       JAVASCRIPT — Single-file vanilla implementation
+       ============================================================ -->
+  <script>
+  (() => {
+    'use strict';
+
+    /* ---------------------------------------------------------
+       Configuration — keep all tunables in one place.
+       MAX_AUDIO_BYTES matches the backend's MAX_AUDIO_FRAME_BYTES.
+       --------------------------------------------------------- */
+    const SESSION_KEY         = 'aura_session_id';
+    const MAX_AUDIO_BYTES     = 16384;   // 16 KiB — backend rejects larger frames
+    const MAX_PTT_DURATION_MS = 8000;    // auto-stop after 8s to protect the user
+    const WS_PATH_TEMPLATE    = 'ws://127.0.0.1:8000/ws/virtual-human/{session_id}';
+
+    /* ---------------------------------------------------------
+       Runtime state
+       --------------------------------------------------------- */
+    let ws            = null;
+    let sessionId     = sessionStorage.getItem(SESSION_KEY) || crypto.randomUUID();
+    let sequence      = 0;
+    let reconnectTimer = null;
+    let audioCtx      = null;
+    let mediaRecorder = null;
+    let pttChunks     = [];
+    let pttStartTime  = 0;
+    let pttAutoStop   = null;
+    let isRecording   = false;
+    let pendingAssistant = null;   // { el: HTMLElement, span: HTMLSpanElement } | null
+
+    /* ---------------------------------------------------------
+       DOM references — cached once for performance
+       --------------------------------------------------------- */
+    const $avatar       = document.getElementById('avatar');
+    const $statusDot    = document.getElementById('status-dot');
+    const $statusBadge  = document.getElementById('status-badge');
+    const $sessionLabel = document.getElementById('session-label');
+    const $chat         = document.getElementById('chat');
+    const $textInput    = document.getElementById('text-input');
+    const $sendBtn      = document.getElementById('send-btn');
+    const $pttBtn       = document.getElementById('ptt-btn');
+    const $log          = document.getElementById('log');
+
+    /* ---------------------------------------------------------
+       Logging — dual output: console + on-page log panel
+       --------------------------------------------------------- */
+    function debug(...args) {
+      const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      const line = `[${ts}] ${args.join(' ')}`;
+      console.log('%c[AuraClient]', 'color:#60a5fa', ...args);
+      $log.textContent += line + '\n';
+      $log.scrollTop = $log.scrollHeight;
+    }
+
+    /* ---------------------------------------------------------
+       Audio helpers (Web Audio API)
+       --------------------------------------------------------- */
+    function getAudioContext() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      return audioCtx;
+    }
+
+    /**
+     * Play a raw audio ArrayBuffer.
+     * 1) Try to decode as a real audio codec (works for real TTS output).
+     * 2) On failure (Mock data is not a valid codec), play a short oscillator
+     *    chirp so the user gets audible feedback that audio is flowing.
+     */
+    async function playArrayBuffer(buffer) {
+      try {
+        const ctx = getAudioContext();
+        const audioBuffer = await ctx.decodeAudioData(buffer.slice(0));
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(ctx.destination);
+        source.start();
+        debug('Audio played (decoded,', audioBuffer.duration.toFixed(2) + 's)');
+      } catch {
+        // Fallback: soft confirmation chirp so the path is never silent.
+        const ctx = getAudioContext();
+        const osc  = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = 880;
+        gain.gain.value = 0.06;
+        osc.connect(gain).connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.07);
+        debug('Audio played (fallback chirp, raw', buffer.byteLength, 'bytes)');
+      }
+    }
+
+    /* ---------------------------------------------------------
+       UI state setters
+       --------------------------------------------------------- */
+    function setStatus(state) {
+      const label = state.charAt(0).toUpperCase() + state.slice(1);
+      $statusBadge.textContent = label;
+
+      // Color scheme per state
+      const styles = {
+        idle:        'bg-gray-800 text-gray-300 border-gray-700',
+        listening:   'bg-gray-800 text-gray-300 border-gray-700',
+        thinking:    'bg-yellow-950 text-yellow-200 border-yellow-800',
+        speaking:    'bg-emerald-950 text-emerald-200 border-emerald-800',
+        interrupted: 'bg-red-950 text-red-200 border-red-800',
+        closed:      'bg-gray-800 text-gray-500 border-gray-700',
+      };
+      $statusBadge.className = `mt-2 px-3 py-0.5 rounded-full text-sm border transition-colors ${styles[state] || styles.idle}`;
+
+      const dotColors = {
+        idle: 'bg-gray-500', listening: 'bg-gray-400', thinking: 'bg-yellow-500',
+        speaking: 'bg-emerald-500', interrupted: 'bg-red-500', closed: 'bg-gray-600',
+      };
+      $statusDot.className = `inline-block w-2.5 h-2.5 rounded-full transition-colors ${dotColors[state] || 'bg-gray-500'}`;
+    }
+
+    function setAvatar(action) {
+      // Remove all state classes, re-add the matching one
+      $avatar.classList.remove('avatar-idle', 'avatar-think', 'avatar-speak');
+      switch (action) {
+        case 'think':  $avatar.classList.add('avatar-think');  break;
+        case 'speak':  $avatar.classList.add('avatar-speak');  break;
+        case 'listen':
+        case 'idle':
+        default:       $avatar.classList.add('avatar-idle');   break;
+      }
+    }
+
+    function scrollToBottom() {
+      requestAnimationFrame(() => {
+        $chat.scrollTop = $chat.scrollHeight;
+      });
+    }
+
+    /* ---------------------------------------------------------
+       Chat rendering
+       --------------------------------------------------------- */
+    function addUserBubble(text) {
+      const el = document.createElement('div');
+      el.className = 'self-end bg-blue-600 rounded-2xl rounded-tr-sm px-4 py-2 max-w-[80%] text-sm leading-relaxed';
+      el.textContent = text;
+      $chat.appendChild(el);
+      scrollToBottom();
+    }
+
+    function addSystemNote(text) {
+      const el = document.createElement('div');
+      el.className = 'self-center text-gray-500 text-xs italic text-center max-w-[90%]';
+      el.textContent = text;
+      $chat.appendChild(el);
+      scrollToBottom();
+    }
+
+    /**
+     * Return the active assistant bubble, creating one if needed.
+     * Each bubble tracks its own typing cursor span.
+     */
+    function ensureAssistantBubble() {
+      if (pendingAssistant) return pendingAssistant;
+      const wrapper = document.createElement('div');
+      wrapper.className = 'self-start bg-gray-800 border border-gray-700 rounded-2xl rounded-tl-sm px-4 py-2 max-w-[80%]';
+
+      const span = document.createElement('span');
+      span.className = 'text-sm leading-relaxed typing-cursor';
+      wrapper.appendChild(span);
+
+      $chat.appendChild(wrapper);
+      scrollToBottom();
+      pendingAssistant = { el: wrapper, span };
+      return pendingAssistant;
+    }
+
+    function finalizeAssistantBubble() {
+      if (!pendingAssistant) return;
+      pendingAssistant.span.classList.remove('typing-cursor');
+      pendingAssistant = null;
+    }
+
+    function handleTextDelta(msg) {
+      const text     = msg.text?.text   || '';
+      const isFinal  = msg.text?.final ?? true;
+
+      if (!text) return;
+
+      const bubble = ensureAssistantBubble();
+      // Append delta — textContent assignment is fast and avoids XSS.
+      bubble.span.textContent += text;
+
+      if (isFinal) {
+        finalizeAssistantBubble();
+      }
+      scrollToBottom();
+    }
+
+    /* ---------------------------------------------------------
+       WebSocket connection + reconnection
+       --------------------------------------------------------- */
+    function buildWsUrl() {
+      return WS_PATH_TEMPLATE.replace('{session_id}', encodeURIComponent(sessionId));
+    }
+
+    function connect() {
+      if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+
+      const url = buildWsUrl();
+      debug('Connecting →', url);
+      ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';   // receive binary as ArrayBuffer
+
+      ws.onopen = () => {
+        debug('Connected (readyState=OPEN)');
+        reconnectTimer = null;
+        setStatus('listening');
+        setAvatar('listen');
+      };
+
+      ws.onmessage = async (event) => {
+        if (typeof event.data === 'string') {
+          try {
+            const msg = JSON.parse(event.data);
+            debug('← JSON', msg.type, msg);
+            handleServerMessage(msg);
+          } catch (err) {
+            debug('JSON parse error:', err, 'raw:', event.data.slice(0, 120));
+          }
+        } else {
+          // Binary audio frame — the backend sends the metadata frame first,
+          // then the raw bytes in a separate binary WebSocket message.
+          debug('← binary', event.data.byteLength, 'bytes');
+          await playArrayBuffer(event.data);
+        }
+      };
+
+      ws.onerror = (err) => {
+        debug('WebSocket error', err);
+      };
+
+      ws.onclose = (event) => {
+        debug('Disconnected — code:', event.code, 'reason:', event.reason || '(none)');
+        scheduleReconnect();
+      };
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimer) return;
+      // Exponential back-off capped at 30 seconds
+      const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+      setStatus('idle');
+      addSystemNote(`⚡ 连接断开，将在 ${delay / 1000}s 后重连...`);
+      debug(`Reconnect scheduled in ${delay}ms (attempt ${reconnectAttempts + 1})`);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        reconnectAttempts++;
+        connect();
+      }, delay);
+    }
+
+    /* ---------------------------------------------------------
+       Server message router
+       --------------------------------------------------------- */
+    function handleServerMessage(msg) {
+      switch (msg.type) {
+
+        case 'text_delta': {
+          handleTextDelta(msg);
+          break;
+        }
+
+        case 'status': {
+          const state = msg.status?.state || 'unknown';
+          setStatus(state);
+          if (state === 'thinking')  setAvatar('think');
+          if (state === 'speaking')  setAvatar('speak');
+          if (state === 'listening' || state === 'idle') setAvatar('listen');
+          if (state === 'interrupted') {
+            setAvatar('idle');
+            finalizeAssistantBubble();
+          }
+          if (state === 'closed') {
+            setAvatar('idle');
+            finalizeAssistantBubble();
+          }
+          break;
+        }
+
+        case 'avatar_action': {
+          const action = msg.avatar?.action || 'idle';
+          setAvatar(action);
+          break;
+        }
+
+        case 'error': {
+          const code    = msg.error?.code    || 'unknown_error';
+          const message = msg.error?.message || 'Unknown error';
+          addSystemNote(`❌ [${code}] ${message}`);
+          finalizeAssistantBubble();
+          break;
+        }
+
+        default:
+          debug('Unhandled message type:', msg.type);
+      }
+    }
+
+    /* ---------------------------------------------------------
+       Client → Server: send text
+       --------------------------------------------------------- */
+    function sendText() {
+      const text = $textInput.value.trim();
+      if (!text) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        addSystemNote('⚠️ 尚未连接，请稍候...');
+        return;
+      }
+
+      const payload = {
+        type: 'text',
+        session_id: sessionId,
+        sequence: sequence++,
+        text: { text, final: true },
+      };
+
+      ws.send(JSON.stringify(payload));
+      debug('→ text', payload);
+      addUserBubble(text);
+      $textInput.value = '';
+      $textInput.focus();
+    }
+
+    /* ---------------------------------------------------------
+       Client → Server: Push-to-Talk (audio)
+       ---------------------------------------------------------
+       NOTE ON PROTOCOL:
+       The backend expects two WebSocket frames in sequence:
+         1. A JSON text frame declaring the audio metadata:
+            { "type": "audio", "session_id": "...", "sequence": N, "audio": { "sample_rate": 16000, "channels": 1 } }
+         2. A binary frame containing the raw PCM/WebM bytes.
+
+       WHY NOT base64-in-JSON?
+       The backend's AudioPayload model has `extra="forbid"`, so any
+       additional key (e.g. "data") would raise a 422 validation error.
+       Sending binary directly is strictly simpler and avoids the 33 %
+       base64 size overhead.
+       --------------------------------------------------------- */
+    async function startRecording() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 }
+        });
+        pttChunks = [];
+        mediaRecorder = new MediaRecorder(stream);
+
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) pttChunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = async () => {
+          stream.getTracks().forEach(t => t.stop());
+
+          const blob = new Blob(pttChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+
+          if (blob.size > MAX_AUDIO_BYTES) {
+            addSystemNote(`⚠️ 录音 ${(blob.size / 1024).toFixed(1)} KB，超过后端限制 ${(MAX_AUDIO_BYTES / 1024)} KB，请缩短时长`);
+            return;
+          }
+
+          // ① Send the audio control frame (text)
+          const ctrl = {
+            type: 'audio',
+            session_id: sessionId,
+            sequence: sequence++,
+            audio: { sample_rate: 16000, channels: 1 },
+          };
+          ws.send(JSON.stringify(ctrl));
+          debug('→ audio ctrl', ctrl);
+
+          // ② Send the binary audio payload
+          const arrayBuffer = await blob.arrayBuffer();
+          //ws.send(arrayBuffer);//
+          debug('→ audio binary', arrayBuffer.byteLength, 'bytes');
+          addSystemNote(`🎤 已发送 ${(arrayBuffer.byteLength / 1024).toFixed(1)} KB 音频`);
+        };
+
+        mediaRecorder.start();
+        isRecording  = true;
+        pttStartTime = Date.now();
+        $pttBtn.classList.add('bg-red-600', 'text-white', 'border-red-400');
+        $pttBtn.textContent = '🔴 录音中... (松开结束)';
+        debug('Recording started');
+
+        // Safety auto-stop so a stuck button can't record forever
+        pttAutoStop = setTimeout(() => {
+          if (isRecording) stopRecording();
+        }, MAX_PTT_DURATION_MS);
+
+      } catch (err) {
+        debug('Microphone error:', err);
+        addSystemNote('⚠️ 无法访问麦克风，请检查浏览器权限设置');
+      }
+    }
+
+    function stopRecording() {
+      if (!isRecording || !mediaRecorder || mediaRecorder.state === 'inactive') return;
+      clearTimeout(pttAutoStop);
+      mediaRecorder.stop();
+      isRecording = false;
+      $pttBtn.classList.remove('bg-red-600', 'text-white', 'border-red-400');
+      $pttBtn.textContent = '🎤 按住说话';
+      debug('Recording stopped, duration:', ((Date.now() - pttStartTime) / 1000).toFixed(1) + 's');
+    }
+
+    /* ---------------------------------------------------------
+       Send interrupt (barge-in)
+       --------------------------------------------------------- */
+    function sendInterrupt() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const payload = {
+        type: 'interrupt',
+        session_id: sessionId,
+        sequence: sequence++,
+        interrupt: { reason: 'user_speech', keep_context: false },
+      };
+      ws.send(JSON.stringify(payload));
+      debug('→ interrupt', payload);
+      addSystemNote('🛑 打断信号已发送');
+    }
+
+    /* ---------------------------------------------------------
+       Event listeners
+       --------------------------------------------------------- */
+    $sendBtn.addEventListener('click', sendText);
+
+    $textInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendText();
+      }
+    });
+
+    // Push-to-talk: mouse + touch
+    $pttBtn.addEventListener('mousedown',  (e) => { e.preventDefault(); startRecording(); });
+    $pttBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); }, { passive: false });
+    $pttBtn.addEventListener('mouseup',    () => { if (isRecording) stopRecording(); });
+    $pttBtn.addEventListener('mouseleave', () => { if (isRecording) stopRecording(); });
+    $pttBtn.addEventListener('touchend',   () => { if (isRecording) stopRecording(); });
+    $pttBtn.addEventListener('touchcancel',() => { if (isRecording) stopRecording(); });
+
+    // Keyboard shortcut: Space to PTT when input is not focused
+    window.addEventListener('keydown', (e) => {
+      if (document.activeElement === $textInput) return;
+      if (e.code === 'Space' && !isRecording) {
+        e.preventDefault();
+        startRecording();
+      }
+    });
+    window.addEventListener('keyup', (e) => {
+      if (e.code === 'Space' && isRecording) {
+        e.preventDefault();
+        stopRecording();
+      }
+    });
+
+    // Interrupt shortcut: Escape
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && ws && ws.readyState === WebSocket.OPEN) {
+        sendInterrupt();
+      }
+    });
+
+    /* ---------------------------------------------------------
+       Boot
+       --------------------------------------------------------- */
+    sessionStorage.setItem(SESSION_KEY, sessionId);
+    $sessionLabel.textContent = `Session: ${sessionId.slice(0, 8)}…`;
+    debug('Session ID:', sessionId);
+    debug('Audio constraint: ≤', MAX_AUDIO_BYTES, 'bytes (~', (MAX_AUDIO_BYTES / 1024).toFixed(0), 'KB)');
+    connect();
+
+  })();
+  </script>
+</body>
+</html>
