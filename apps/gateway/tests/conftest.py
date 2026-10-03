@@ -7,7 +7,9 @@ because ``Settings`` is cached at first use.
 from __future__ import annotations
 
 import os
+import sys
 from typing import TYPE_CHECKING
+from unittest import mock
 
 from fastapi.testclient import TestClient
 import pytest
@@ -16,6 +18,29 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     import httpx
+
+# Force a network-safe fake for edge_tts unconditionally. The mock must live in
+# sys.modules before any test module imports `aura_gateway.pipeline.streaming`,
+# otherwise the real module would be loaded and the processor would hit the
+# network during websocket/integration tests.
+_mock_edge_tts = mock.MagicMock()
+
+
+async def _fake_tts_stream(*args: object, **kwargs: object):
+    yield {"type": "audio", "data": b"fake-audio-chunk"}
+
+
+_mock_edge_tts.Communicate.return_value.stream = _fake_tts_stream
+sys.modules["edge_tts"] = _mock_edge_tts
+
+
+@pytest.fixture(autouse=True)
+def _mock_edge_tts_on_streaming(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Also patch streaming.edge_tts in case the module was imported early."""
+    import aura_gateway.pipeline.streaming as streaming
+
+    monkeypatch.setattr(streaming, "edge_tts", _mock_edge_tts, raising=False)
+
 
 # No database is reachable from the test runner; the engine still gets built so
 # the pool wiring is exercised, but nothing attempts a real handshake.

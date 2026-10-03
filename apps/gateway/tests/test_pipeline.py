@@ -7,8 +7,12 @@ mapping and retry policy are exercised without a network.
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 import httpx
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 from llm_doubles import (
     AsyncByteStream,
     delayed_sse_bytes,
@@ -48,7 +52,13 @@ SETTINGS = Settings(_env_file=None, LLM_API_KEY="test-key", LLM_RETRY_BACKOFF=0.
 def _pipeline(handler: object, **kwargs: object) -> StreamingPipeline:
     """Build a pipeline wired to a mocked upstream."""
     client = mock_client(handler)  # type: ignore[arg-type]
-    return StreamingPipeline("s1", client=client, settings=SETTINGS, **kwargs)  # type: ignore[arg-type]
+    pipeline = StreamingPipeline("s1", client=client, settings=SETTINGS, **kwargs)  # type: ignore[arg-type]
+
+    async def _fake_tts(text: str) -> AsyncIterator[bytes]:
+        yield b"fake-audio-chunk"
+
+    pipeline._real_tts_stream = _fake_tts  # type: ignore[method-assign]
+    return pipeline
 
 
 def _text_message(session_id: str = "s1", text: str = "你好") -> ClientTextMessage:

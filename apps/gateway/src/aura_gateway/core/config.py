@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     # Shared connection pool for the process-wide AsyncClient.
     LLM_MAX_CONNECTIONS: int = Field(default=100, ge=1, le=1_000)
 
+    # ---- TTS ------------------------------------------------------------------
+    # Edge-TTS voice identifier used by the virtual-human speech stage.
+    TTS_VOICE: str = Field(default="zh-CN-XiaoxiaoNeural")
+
     # ---- CORS -----------------------------------------------------------------
     # ``NoDecode`` keeps pydantic-settings from JSON-parsing the raw environment
     # value; the validator below splits the comma-separated list instead.

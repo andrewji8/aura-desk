@@ -26,6 +26,7 @@ from dataclasses import dataclass
 import json
 from typing import TYPE_CHECKING, Any, Final
 
+import edge_tts
 import httpx
 
 from aura_gateway.core.config import Settings, get_settings
@@ -63,14 +64,9 @@ __all__ = [
 #: Sentinel pushed onto ``input_queue`` to ask the processor to return cleanly.
 SHUTDOWN: Final = object()
 
-#: Mock stage latencies in seconds. Deliberately short so a full round trip
-#: finishes inside a test, yet non-zero to keep cancellation observable.
+#: Mock ASR latency in seconds. Deliberately non-zero so cancellation
+#: remains observable while the TTS stage is real.
 ASR_LATENCY: Final = 0.02
-TTS_CHUNK_INTERVAL: Final = 0.01
-
-#: Size of one mock TTS chunk, and how many characters of text produce one.
-TTS_CHUNK_BYTES: Final = 1_024
-TTS_CHUNK_CHARS: Final = 6
 
 #: SSE framing constants for the OpenAI-compatible streaming protocol.
 _SSE_DATA_PREFIX: Final = "data:"
@@ -374,19 +370,26 @@ class StreamingPipeline:
         self._log.info("pipeline.asr_completed", audio_bytes=len(audio))
         return f"模拟语音输入({len(audio)} 字节)"
 
-    async def _mock_tts_stream(self, text: str) -> AsyncIterator[bytes]:
-        """Yield synthesized speech as fixed-size chunks.
+    async def _real_tts_stream(self, text: str) -> AsyncIterator[bytes]:
+        """Stream synthesized speech chunks from Edge TTS.
 
-        The payload is filler rather than real audio: during infrastructure
-        bring-up the chunk cadence is what the sender and client depend on.
+        Uses :meth:`edge_tts.Communicate.stream` to generate real MP3 audio
+        chunks asynchronously, yielding each chunk as it becomes available
+        rather than waiting for the entire utterance to be synthesized.
 
         Args:
-            text: The reply being spoken, which sets the chunk count.
+            text: The assistant reply being spoken.
+
+        Yields:
+            Raw MP3 audio bytes produced by Edge TTS for each streamed chunk.
         """
-        chunk_count = max(1, -(-len(text) // TTS_CHUNK_CHARS))
-        for _ in range(chunk_count):
-            await asyncio.sleep(TTS_CHUNK_INTERVAL)
-            yield bytes(TTS_CHUNK_BYTES)
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice=self._settings.TTS_VOICE,
+        )
+        async for chunk in communicate.stream():
+            if chunk.get("type") == "audio":
+                yield chunk["data"]
 
     # ---- real LLM stage -----------------------------------------------------
 
@@ -765,7 +768,15 @@ class StreamingPipeline:
         await self._emit_avatar(AvatarAction.SPEAK)
 
         audio_sequence = 0
-        async for chunk in self._mock_tts_stream(full_reply):
+        # 关键修复 1: 先收集所有 chunk, 以便我们知道哪一个是最后一个
+        tts_chunks = []
+        async for chunk in self._real_tts_stream(full_reply):
+            tts_chunks.append(chunk)  # noqa: PERF401
+
+        # 关键修复 2: 遍历收集到的 chunks, 动态设置 final 标记
+        for idx, chunk in enumerate(tts_chunks):
+            is_final = idx == len(tts_chunks) - 1  # 最后一个 chunk 设为 True
+
             await output_queue.put(
                 PipelineItem(
                     message=build_server_message(
@@ -776,13 +787,13 @@ class StreamingPipeline:
                             sample_rate=24_000,
                             channels=1,
                             sequence=audio_sequence,
-                            final=False,
+                            final=is_final,  # <--- 必须动态设置
                         ),
                     ),
                     audio=chunk,
                 ),
             )
-            audio_sequence += 1
+            audio_sequence += 1  # noqa: SIM113
 
         self._log.info("pipeline.turn_completed", turn=self._turn, deltas=sequence)
 

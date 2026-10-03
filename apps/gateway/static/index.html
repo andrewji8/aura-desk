@@ -152,6 +152,7 @@
     let pttAutoStop   = null;
     let isRecording   = false;
     let pendingAssistant = null;   // { el: HTMLElement, span: HTMLSpanElement } | null
+    let pendingAudioChunks = []; // 用于累积 MP3 碎片
 
     /* ---------------------------------------------------------
        DOM references — cached once for performance
@@ -353,10 +354,9 @@
             debug('JSON parse error:', err, 'raw:', event.data.slice(0, 120));
           }
         } else {
-          // Binary audio frame — the backend sends the metadata frame first,
-          // then the raw bytes in a separate binary WebSocket message.
+          // 关键修复：不再立即播放，而是将 ArrayBuffer 转为 Uint8Array 并累积
           debug('← binary', event.data.byteLength, 'bytes');
-          await playArrayBuffer(event.data);
+          pendingAudioChunks.push(new Uint8Array(event.data));
         }
       };
 
@@ -418,6 +418,14 @@
           break;
         }
 
+        case 'audio_chunk': {
+          const isFinal = msg.audio?.final ?? false;
+          if (isFinal) {
+            playAccumulatedAudio(); // 收到 final 标记，触发合并播放
+          }
+          break;
+        }
+
         case 'error': {
           const code    = msg.error?.code    || 'unknown_error';
           const message = msg.error?.message || 'Unknown error';
@@ -428,6 +436,53 @@
 
         default:
           debug('Unhandled message type:', msg.type);
+      }
+    }
+
+    /**
+     * 合并所有累积的 MP3 碎片并播放
+     */
+    async function playAccumulatedAudio() {
+      if (pendingAudioChunks.length === 0) return;
+      
+      // 1. 计算总长度
+      let totalLength = 0;
+      for (const chunk of pendingAudioChunks) {
+        totalLength += chunk.length;
+      }
+      
+      // 2. 合并为一个完整的 Uint8Array
+      const combined = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const chunk of pendingAudioChunks) {
+        combined.set(chunk, offset);
+        offset += chunk.length;
+      }
+      
+      // 3. 立即清空数组，防止内存泄漏和下一句声音重叠
+      pendingAudioChunks = [];
+      
+      // 4. 尝试解码并播放完整的 MP3
+      try {
+        const ctx = getAudioContext();
+        const audioBuffer = await ctx.decodeAudioData(combined.buffer);
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(ctx.destination);
+        source.start();
+        debug('✅ Audio played (decoded accumulated,', audioBuffer.duration.toFixed(2) + 's)');
+      } catch (err) {
+        debug('❌ Audio decode failed, using fallback chirp', err);
+        // 保留原有的 880Hz fallback，以防万一
+        const ctx = getAudioContext();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = 880;
+        gain.gain.value = 0.06;
+        osc.connect(gain).connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.07);
       }
     }
 
